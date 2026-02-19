@@ -551,7 +551,9 @@ class MambaMixerSSM(nn.Module):
 
             scan_output = (hs @ C.unsqueeze(-1)).squeeze(3).transpose(1, 2) # [batch, intermediate_size, seq_len]
             scan_output = scan_output + hidden_states * self.D[None, :, None]
-            gate = torch.zeros(batch_size, self.intermediate_size, seq_len)
+            gate = torch.zeros(batch_size, self.intermediate_size, seq_len).to(scan_output.device)
+            scan_output = scan_output.contiguous()
+            gate = gate.contiguous()
             dist.broadcast(scan_output, src=1)
             dist.broadcast(gate, src=0)
             scan_output = scan_output * gate
@@ -563,7 +565,9 @@ class MambaMixerSSM(nn.Module):
                 scan_outputs.append(scan_output[:, :, 0])
             scan_output = torch.stack(scan_outputs, dim=-1)                                # [batch, intermediate_size, seq_len]
             scan_output = scan_output + (hidden_states * self.D[None, :, None])
-            gate = torch.zeros(batch_size, self.intermediate_size, seq_len)
+            gate = torch.zeros(batch_size, self.intermediate_size, seq_len).to(scan_output.device)
+            scan_output = scan_output.contiguous()
+            gate = gate.contiguous()
             dist.broadcast(scan_output, src=1)
             dist.broadcast(gate, src=0)
             scan_output = scan_output * gate
@@ -614,7 +618,9 @@ class MambaMixerGate(nn.Module):
         gate = self.in_proj(input_states).transpose(1, 2)                   # [batch, intermediate_size, seq_len]
         gate = self.act(gate)
 
-        scan_output = torch.zeros(batch, self.intermediate_size, seq_len)
+        scan_output = torch.zeros(batch, self.intermediate_size, seq_len).to(gate.device)
+        scan_output = scan_output.contiguous()
+        gate = gate.contiguous()
         dist.broadcast(gate, src=0)
         dist.broadcast(scan_output, src=1)
 
@@ -662,13 +668,16 @@ def setup(rank, world_size):
 def cleanup():
     dist.destroy_process_group()
 
-def mamba_worker(rank, world_size, hidden_states, cache_params, cache_position, attention_mask, output_hidden_states, layers, queue):
+def mamba_worker(rank, world_size, hidden_states, cache_params, cache_position, attention_mask, output_hidden_states, layers, devices): 
     setup(rank, world_size)
 
-    dist.broadcast(hidden_states, src=0)
+    device = devices[rank]
+    print(f"Worker {rank} using device {device}.")
+    hidden_states = hidden_states.to(device)
+    layers = [block.to(device) for block in layers[rank]]
 
     all_hidden_states = () if output_hidden_states else None
-    for mixer_block in layers[rank]:
+    for mixer_block in layers:
         hidden_states = mixer_block(
             hidden_states,
             cache_params=cache_params,
@@ -679,7 +688,6 @@ def mamba_worker(rank, world_size, hidden_states, cache_params, cache_position, 
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
     
-    queue.put((hidden_states, all_hidden_states))
     cleanup()
 
 class MambaBlock(GradientCheckpointingLayer):
@@ -831,9 +839,10 @@ class MambaModel(MambaPreTrainedModel):
         if self.world_size == 1:
             self.layers = nn.ModuleList([MambaBlock(config, layer_idx=idx, MixerClass=MambaMixer) for idx in range(config.num_hidden_layers)])
         elif self.world_size == 2:
-            self.layers = []
-            self.layers.append(nn.ModuleList([MambaBlock(config, layer_idx=idx, MixerClass=MambaMixerGate) for idx in range(config.num_hidden_layers)]))
-            self.layers.append(nn.ModuleList([MambaBlock(config, layer_idx=idx, MixerClass=MambaMixerSSM) for idx in range(config.num_hidden_layers)]))
+            self.layers = nn.ModuleList([
+                nn.ModuleList([MambaBlock(config, layer_idx=idx, MixerClass=MambaMixerGate) for idx in range(config.num_hidden_layers)]),
+                nn.ModuleList([MambaBlock(config, layer_idx=idx, MixerClass=MambaMixerSSM) for idx in range(config.num_hidden_layers)])
+                ])
         else:
             raise ValueError("Only world sizes of 1 and 2 are supported for now")
 
@@ -922,12 +931,15 @@ class MambaModel(MambaPreTrainedModel):
                 if output_hidden_states:
                     all_hidden_states = all_hidden_states + (hidden_states,)
         else:
-            queue = mp.Queue()
-            inputs_embeds.to(self.devices[0])
-            mp.spawn(self.world_size, mamba_worker, \
-                     args=(self.world_size, inputs_embeds, cache_params, cache_position, \
-                           attention_mask, output_hidden_states, self.layers, queue), join=True)
-            hidden_states, all_hidden_states = queue.get()
+            
+            inputs_embeds = inputs_embeds.detach()
+            with torch.no_grad():
+                mp.spawn(mamba_worker, 
+                        args=(self.world_size, inputs_embeds, cache_params, cache_position, 
+                            attention_mask, output_hidden_states, self.layers, self.devices), # , queue),
+                            nprocs=self.world_size, join=True)
+            hidden_states = inputs_embeds
+            all_hidden_states = () if output_hidden_states else None
 
         hidden_states = self.norm_f(hidden_states)
 
