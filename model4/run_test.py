@@ -1,26 +1,40 @@
 import torch
 from transformers import AutoTokenizer, MambaForCausalLM
 
-# Load pretrained model and tokenizer
-# model_name = "state-spaces/mamba-130m-hf"
+seed = 42
+
+torch.manual_seed(seed)
+torch.cuda.manual_seed(seed)
+torch.cuda.manual_seed_all(seed)
+
 model_name = "state-spaces/mamba-2.8b-hf"
-model = MambaForCausalLM.from_pretrained(model_name)
+model = MambaForCausalLM.from_pretrained(model_name).to("cuda:3")
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-# Copy vocab size from model configuration
 vocab_size = model.config.vocab_size
 
-# Define batch size and sequence length
 batch_size = 2
-seq_len = 16
+seq_len = 128
 
-# Create random input token IDs within vocab range
-input_ids = torch.randint(low=0, high=vocab_size, size=(batch_size, seq_len))
+# # Create input_ids on CPU first
+# input_ids = torch.randint(
+#     low=0,
+#     high=50280,  # Assuming vocab size of 50280, adjust if needed
+#     size=(2, 128)
+# )
 
-# Forward pass
-outputs = model(
-    input_ids,
-    return_dict=True
-)
+# input_ids = input_ids.to("cuda:3")
 
-print(outputs)
+input_ids = torch.load("../model6/input_ids.pt").to("cuda:3")
+
+torch.save(input_ids, "../model6/layers_output/orig_mamba/main_input_ids/main_input_ids_layer_0.pt")
+
+outputs = model(input_ids=input_ids, return_dict=True)
+
+# Move to CPU before saving
+logits = outputs.logits.detach().cpu()
+
+# Save as PyTorch file
+torch.save(logits, "../model6/mamba_outputs.pt")
+
+print("Saved logits to mamba_outputs.pt")
